@@ -301,6 +301,13 @@ Generation generate(
   auto run_tokens = [&](const std::vector<uint64_t>& tokens, int64_t position) {
     set_tokens(tokens);
     set_positions(position, tokens.size());
+    // A selected-logits method takes the token indices to return; the runner
+    // wants only the last.
+    if (executable.num_inputs() == 3) {
+      const int64_t last = static_cast<int64_t>(tokens.size()) - 1;
+      executable.resize_input(2, {1});
+      executable.set_input(2, &last, 1, ptn::kLong);
+    }
     executable.execute();
     const std::vector<int64_t> output_shape =
         executable.output_sizes(logits_output);
@@ -528,8 +535,12 @@ int run_llm(
         elapsed_ms(load_start, load_end));
     std::printf("constants: %zu package bytes\n", package->constant_bytes());
 
-    if (executable->num_inputs() != 2) {
-      throw std::runtime_error("runner requires token and position inputs");
+    // A third input selects the token indices whose logits to return.
+    const size_t num_inputs = executable->num_inputs();
+    if (num_inputs != 2 && num_inputs != 3) {
+      throw std::runtime_error(
+          "runner requires token and position inputs, and optionally the "
+          "token indices whose logits to return");
     }
     if (logits_output >= executable->num_outputs()) {
       throw std::runtime_error("logits output is outside engine outputs");
@@ -548,11 +559,11 @@ int run_llm(
       throw std::runtime_error(
           "position input must have one element or one per token");
     }
-    for (size_t i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < num_inputs; ++i) {
       const ptn::ScalarType dtype = executable->input_dtype(i);
       if (dtype != ptn::kInt && dtype != ptn::kLong) {
         throw std::runtime_error(
-            "token and position inputs must be Int or Long, got " +
+            "token, position and index inputs must be Int or Long, got " +
             std::string(ptn::scalar_type_name(dtype)));
       }
     }
@@ -593,7 +604,7 @@ int run_llm(
                 " runs method " + calls[j].method +
                 ", but the runner replays only " + method_name);
           }
-          if (calls[j].inputs.size() != 2 || !calls[j].outputs ||
+          if (calls[j].inputs.size() != num_inputs || !calls[j].outputs ||
               calls[j].outputs->size() <= logits_output ||
               (*calls[j].outputs)[logits_output].dtype != ptn::kFloat ||
               (*calls[j].outputs)[logits_output].sizes.empty() ||
@@ -619,8 +630,12 @@ int run_llm(
               static_cast<int64_t>(j == 0 ? 0 : prompt.size() + j - 1);
           std::vector<int64_t> positions(per_token_positions ? count : 1);
           std::iota(positions.begin(), positions.end(), start);
+          const std::vector<int64_t> last_index = {
+              static_cast<int64_t>(ids.size()) - 1};
           if (ids.empty() || (j > 0 && ids.size() != 1) ||
-              integer_values(calls[j].inputs[1]) != positions) {
+              integer_values(calls[j].inputs[1]) != positions ||
+              (num_inputs == 3 &&
+               integer_values(calls[j].inputs[2]) != last_index)) {
             throw std::runtime_error(
                 "sample " + std::to_string(i) + " call " + std::to_string(j) +
                 " is not a prefill or the next decode step");
