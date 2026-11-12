@@ -9,6 +9,9 @@
 #if defined(EXECUTORCH_BUILD_MLX)
 #include <executorch/examples/models/muse-glimmer/runtime/mlx_executor.h>
 #endif
+#if defined(EXECUTORCH_BUILD_NATIVE)
+#include <executorch/examples/models/muse-glimmer/runtime/native_executor.h>
+#endif
 #if defined(EXECUTORCH_BUILD_CUDA)
 #include <executorch/backends/cuda/batching/cuda_executor.h>
 #include <executorch/examples/models/muse-glimmer/runtime/cuda_dflash_executor.h>
@@ -23,6 +26,11 @@ runtime::Result<MuseGlimmerBackend> create_muse_glimmer_backend(
 #if defined(EXECUTORCH_BUILD_MLX)
   if (config.backend == "mlx") {
     return MuseGlimmerMLXExecutor::create(config);
+  }
+#endif
+#if defined(EXECUTORCH_BUILD_NATIVE)
+  if (config.backend == "native") {
+    return MuseGlimmerNativeExecutor::create(config);
   }
 #endif
 #if defined(EXECUTORCH_BUILD_CUDA)
