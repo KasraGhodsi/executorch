@@ -1415,6 +1415,9 @@ struct InstalledCache {
   kv::SequenceControl& control() {
     return *cache->as<kv::SequenceControl>();
   }
+  kv::BatchControl& batch() {
+    return *cache->as<kv::BatchControl>();
+  }
 };
 
 // One layer per entry of `windows`: flat for 0, else a ring of that window.
@@ -1424,7 +1427,8 @@ InstalledCache install_cache(
     ScalarType kv_dtype = ScalarType::Float,
     int head_dim = static_cast<int>(kOffGraphDim),
     const std::vector<int>& windows = {0},
-    std::optional<int> max_write = std::nullopt) {
+    std::optional<int> max_write = std::nullopt,
+    const char* kind = kv::kind::kSingle) {
   register_ggml_cache_builders();
   kv::CacheGeometry geometry;
   for (const int window : windows) {
@@ -1441,7 +1445,7 @@ InstalledCache install_cache(
       .initial_capacity = initial_capacity,
       .max_write = max_write};
   auto built = kv::CacheFactory::global().build(
-      kGgmlCacheBackendId, kv::kind::kSingle, geometry, cfg);
+      kGgmlCacheBackendId, kind, geometry, cfg);
   if (!built.ok()) {
     throw std::runtime_error("failed to build the test cache");
   }
@@ -1764,6 +1768,274 @@ TEST(GgmlEngineTest, OffGraphRingRewindsWithinTheRowsItHolds) {
   EXPECT_THROW(reference.step(*decode, 6, 1), std::runtime_error);
   EXPECT_LT(reference.step(*decode, 7, 1, /*seed=*/4), 1e-4f);
   EXPECT_LT(reference.step(*decode, 8, 1, /*seed=*/4), 1e-4f);
+}
+
+// What a cell cache should hold: K and V [Hkv, D] per (sequence, position),
+// a history per sequence that a clone copies, attended causally within the
+// sequence by naive softmax attention, over the last `window` positions when
+// it is nonzero.
+class CellReference {
+ public:
+  explicit CellReference(int window = 0) : window_(window) {}
+
+  void clone(int32_t source, int32_t target, int upto) {
+    history_[target].assign(
+        history_[source].begin(), history_[source].begin() + upto);
+  }
+  void rewind(int32_t seq, int position) {
+    history_[seq].resize(static_cast<size_t>(position));
+  }
+
+  // Runs one token per (sequence, position) through `executable`, after
+  // `batch` declares their sequences, and returns the largest difference from
+  // the reference.
+  float step(
+      EngineExecutable& executable,
+      kv::BatchControl& batch,
+      const std::vector<std::pair<int32_t, int64_t>>& tokens,
+      int seed = 0) {
+    const auto n = static_cast<int64_t>(tokens.size());
+    const int64_t kv_row = kOffGraphKvHeads * kOffGraphDim;
+    std::vector<float> q(kOffGraphHeads * n * kOffGraphDim);
+    std::vector<float> k(kOffGraphKvHeads * n * kOffGraphDim);
+    std::vector<float> v(k.size());
+    std::vector<int64_t> positions;
+    std::vector<int32_t> seq_ids;
+    for (int64_t t = 0; t < n; ++t) {
+      const auto [seq, pos] = tokens[t];
+      positions.push_back(pos);
+      seq_ids.push_back(seq);
+      const double salt = 1.3 * seq + seed;
+      std::vector<std::vector<float>>& history = history_[seq];
+      if (static_cast<int64_t>(history.size()) != pos) {
+        throw std::logic_error("reference: positions must continue");
+      }
+      history.emplace_back(2 * kv_row);
+      for (int64_t h = 0; h < kOffGraphHeads; ++h) {
+        for (int64_t d = 0; d < kOffGraphDim; ++d) {
+          q[(h * n + t) * kOffGraphDim + d] = static_cast<float>(
+              std::sin(0.17 * pos + 0.9 * h - 0.21 * d + salt));
+        }
+      }
+      for (int64_t h = 0; h < kOffGraphKvHeads; ++h) {
+        for (int64_t d = 0; d < kOffGraphDim; ++d) {
+          const auto key = static_cast<float>(
+              std::sin(0.3 * pos + 0.7 * h + 0.13 * d + 2 * salt));
+          const auto value = static_cast<float>(
+              std::cos(0.2 * pos - 0.5 * h + 0.31 * d + salt) * (1 + pos % 3));
+          k[(h * n + t) * kOffGraphDim + d] = key;
+          v[(h * n + t) * kOffGraphDim + d] = value;
+          history.back()[h * kOffGraphDim + d] = key;
+          history.back()[kv_row + h * kOffGraphDim + d] = value;
+        }
+      }
+    }
+    if (!batch.declare_step(seq_ids)) {
+      throw std::runtime_error("reference: the cache refused the step");
+    }
+    executable.set_input(0, q.data(), q.size(), ScalarType::Float);
+    executable.set_input(1, k.data(), k.size(), ScalarType::Float);
+    executable.set_input(2, v.data(), v.size(), ScalarType::Float);
+    executable.set_input(
+        3, positions.data(), positions.size(), ScalarType::Long);
+    executable.execute();
+    std::vector<float> out(q.size());
+    executable.get_output(0, out.data(), out.size(), ScalarType::Float);
+
+    float worst = 0.0f;
+    for (int64_t t = 0; t < n; ++t) {
+      const auto [seq, pos] = tokens[t];
+      const std::vector<std::vector<float>>& history = history_[seq];
+      const int64_t first =
+          window_ > 0 ? std::max<int64_t>(0, pos + 1 - window_) : 0;
+      for (int64_t h = 0; h < kOffGraphHeads; ++h) {
+        const int64_t kv_head = h / (kOffGraphHeads / kOffGraphKvHeads);
+        const float* query = &q[(h * n + t) * kOffGraphDim];
+        std::vector<double> weights(static_cast<size_t>(pos + 1), 0.0);
+        double total = 0.0;
+        for (int64_t s = first; s <= pos; ++s) {
+          weights[s] = std::exp(
+              std::inner_product(
+                  query,
+                  query + kOffGraphDim,
+                  &history[s][kv_head * kOffGraphDim],
+                  0.0) *
+              kOffGraphScale);
+          total += weights[s];
+        }
+        for (int64_t d = 0; d < kOffGraphDim; ++d) {
+          double sum = 0.0;
+          for (int64_t s = first; s <= pos; ++s) {
+            sum += weights[s] * history[s][kv_row + kv_head * kOffGraphDim + d];
+          }
+          worst = std::max(
+              worst,
+              std::abs(
+                  out[(h * n + t) * kOffGraphDim + d] -
+                  static_cast<float>(sum / total)));
+        }
+      }
+    }
+    return worst;
+  }
+
+ private:
+  int window_;
+  std::map<int32_t, std::vector<std::vector<float>>> history_;
+};
+
+InstalledCache install_cell_cache(
+    int capacity,
+    int initial_capacity,
+    ScalarType kv_dtype = ScalarType::Float,
+    const std::vector<int>& windows = {0}) {
+  return install_cache(
+      capacity,
+      initial_capacity,
+      kv_dtype,
+      static_cast<int>(kOffGraphDim),
+      windows,
+      std::nullopt,
+      kv::kind::kBatchedCell);
+}
+
+// Two sequences prefill separately, then decode together in one forward,
+// across graph caching modes and both storage types. Storage starts at one
+// row, so it regrows as the cells fill.
+TEST(GgmlEngineTest, CellCacheServesInterleavedSequences) {
+  for (const size_t graphs : {size_t{0}, size_t{4}}) {
+    for (const auto& [dtype, tol] :
+         {std::pair{ScalarType::Float, 1e-4f},
+          std::pair{ScalarType::Half, 2e-2f}}) {
+      SCOPED_TRACE(
+          "graphs " + std::to_string(graphs) + ", " +
+          std::string(scalar_type_name(dtype)));
+      InstalledCache cache = install_cell_cache(64, 1, dtype);
+      auto host = GgmlEngineHost::create({.max_cached_graphs = graphs});
+      auto prefill_context =
+          make_context(*host, make_update_and_attend_program(3), cache.options);
+      auto decode_context =
+          make_context(*host, make_update_and_attend_program(2), cache.options);
+      auto prefill = prefill_context->compile("forward");
+      auto decode = decode_context->compile("forward");
+      const int32_t a = *cache.batch().seq_new();
+      const int32_t b = *cache.batch().seq_new();
+      CellReference reference;
+      EXPECT_LT(
+          reference.step(*prefill, cache.batch(), {{a, 0}, {a, 1}, {a, 2}}),
+          tol);
+      EXPECT_LT(
+          reference.step(*prefill, cache.batch(), {{b, 0}, {b, 1}, {b, 2}}),
+          tol);
+      for (int64_t pos = 3; pos < 12; ++pos) {
+        SCOPED_TRACE(pos);
+        EXPECT_LT(
+            reference.step(*decode, cache.batch(), {{a, pos}, {b, pos}}), tol);
+      }
+      EXPECT_EQ(cache.batch().pos(a), 12);
+      EXPECT_EQ(cache.batch().pos(b), 12);
+    }
+  }
+}
+
+// A clone shares its source's cells below the fork, and each continues on its
+// own; a rewind drops the positions it passes.
+TEST(GgmlEngineTest, CellCacheClonesAndRewindsSequences) {
+  InstalledCache cache = install_cell_cache(64, 4);
+  auto host = GgmlEngineHost::create();
+  auto prefill_context =
+      make_context(*host, make_update_and_attend_program(3), cache.options);
+  auto decode_context =
+      make_context(*host, make_update_and_attend_program(2), cache.options);
+  auto single_context =
+      make_context(*host, make_update_and_attend_program(1), cache.options);
+  auto prefill = prefill_context->compile("forward");
+  auto decode = decode_context->compile("forward");
+  auto single = single_context->compile("forward");
+  const int32_t a = *cache.batch().seq_new();
+  CellReference reference;
+  EXPECT_LT(
+      reference.step(*prefill, cache.batch(), {{a, 0}, {a, 1}, {a, 2}}), 1e-4f);
+  for (int64_t pos = 3; pos < 6; ++pos) {
+    EXPECT_LT(reference.step(*single, cache.batch(), {{a, pos}}), 1e-4f);
+  }
+  const auto b = cache.batch().seq_clone(a, 4);
+  ASSERT_TRUE(b.has_value());
+  reference.clone(a, *b, 4);
+  EXPECT_EQ(cache.batch().pos(*b), 4);
+  for (int64_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_LT(
+        reference.step(*decode, cache.batch(), {{a, 6 + i}, {*b, 4 + i}}),
+        1e-4f);
+  }
+  ASSERT_TRUE(cache.batch().rewind(a, 3));
+  reference.rewind(a, 3);
+  EXPECT_LT(
+      reference.step(*single, cache.batch(), {{a, 3}}, /*seed=*/7), 1e-4f);
+  EXPECT_LT(
+      reference.step(*decode, cache.batch(), {{a, 4}, {*b, 7}}, /*seed=*/7),
+      1e-4f);
+  // Closing the clone frees its own cells and leaves the source's.
+  ASSERT_TRUE(cache.batch().seq_rm(*b));
+  EXPECT_LT(
+      reference.step(*single, cache.batch(), {{a, 5}}, /*seed=*/7), 1e-4f);
+}
+
+// A windowed layer keeps every cell and its mask narrows to the window, within
+// a prefill wider than the window too.
+TEST(GgmlEngineTest, CellCacheMasksSlidingWindows) {
+  for (const int window : {2, 5}) {
+    SCOPED_TRACE(window);
+    InstalledCache cache =
+        install_cell_cache(64, 2, ScalarType::Float, {window});
+    auto host = GgmlEngineHost::create();
+    auto prefill_context =
+        make_context(*host, make_update_and_attend_program(3), cache.options);
+    auto decode_context =
+        make_context(*host, make_update_and_attend_program(2), cache.options);
+    auto prefill = prefill_context->compile("forward");
+    auto decode = decode_context->compile("forward");
+    const int32_t a = *cache.batch().seq_new();
+    const int32_t b = *cache.batch().seq_new();
+    CellReference reference(window);
+    EXPECT_LT(
+        reference.step(*prefill, cache.batch(), {{a, 0}, {a, 1}, {a, 2}}),
+        1e-4f);
+    EXPECT_LT(
+        reference.step(*prefill, cache.batch(), {{b, 0}, {a, 3}, {b, 1}}),
+        1e-4f);
+    for (int64_t i = 0; i < 6; ++i) {
+      EXPECT_LT(
+          reference.step(*decode, cache.batch(), {{a, 4 + i}, {b, 2 + i}}),
+          1e-4f);
+    }
+  }
+}
+
+// The cache places only a declared step whose positions continue each
+// sequence.
+TEST(GgmlEngineTest, CellCacheRefusesUndeclaredSteps) {
+  InstalledCache cache = install_cell_cache(64, 4);
+  auto host = GgmlEngineHost::create();
+  auto context =
+      make_context(*host, make_update_and_attend_program(1), cache.options);
+  auto executable = context->compile("forward");
+  const int32_t a = *cache.batch().seq_new();
+  CellReference reference;
+  const std::vector<float> q(kOffGraphHeads * kOffGraphDim);
+  const std::vector<float> kv_step(kOffGraphKvHeads * kOffGraphDim);
+  const auto run_at = [&](int64_t position) {
+    executable->set_input(0, q.data(), q.size(), ScalarType::Float);
+    executable->set_input(1, kv_step.data(), kv_step.size(), ScalarType::Float);
+    executable->set_input(2, kv_step.data(), kv_step.size(), ScalarType::Float);
+    executable->set_input(3, &position, 1, ScalarType::Long);
+    executable->execute();
+  };
+  EXPECT_THROW(run_at(0), std::invalid_argument);
+  ASSERT_TRUE(cache.batch().declare_step({a}));
+  EXPECT_THROW(run_at(1), std::invalid_argument);
+  EXPECT_LT(reference.step(*executable, cache.batch(), {{a, 0}}), 1e-4f);
 }
 
 TEST(GgmlEngineTest, OffGraphAttentionNeedsAMatchingCache) {

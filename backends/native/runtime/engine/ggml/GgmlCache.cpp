@@ -180,6 +180,22 @@ void* GgmlSequenceCache::face(cache::FaceId id) {
       GgmlSequenceCache>(this, id);
 }
 
+GgmlCellCache::GgmlCellCache(
+    const cache::CacheGeometry& geometry,
+    const cache::CacheConfig& cfg)
+    : CellCache(checked(geometry, cfg), cfg),
+      pool_(
+          geometry,
+          cfg.kv_dtype,
+          cfg.initial_capacity,
+          cfg.capacity,
+          std::vector<int>(geometry.layers.size(), 0)) {}
+
+void* GgmlCellCache::face(cache::FaceId id) {
+  return cache::
+      expose<cache::BatchControl, cache::CellStepper, GgmlCellCache>(this, id);
+}
+
 void register_ggml_cache_builders() {
   // Registering twice is harmless; the first builder stays.
   (void)cache::CacheFactory::global().register_builder(
@@ -188,6 +204,15 @@ void register_ggml_cache_builders() {
       [](const cache::CacheGeometry& geometry, const cache::CacheConfig& cfg) {
         return std::make_shared<GgmlSequenceCache>(geometry, cfg);
       });
+  for (const char* kind : {cache::kind::kBatched, cache::kind::kBatchedCell}) {
+    (void)cache::CacheFactory::global().register_builder(
+        kGgmlCacheBackendId,
+        kind,
+        [](const cache::CacheGeometry& geometry,
+           const cache::CacheConfig& cfg) {
+          return std::make_shared<GgmlCellCache>(geometry, cfg);
+        });
+  }
 }
 
 } // namespace ptn
